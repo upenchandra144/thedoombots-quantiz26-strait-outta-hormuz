@@ -24,6 +24,7 @@ from src.metrics import (
     portfolio_metrics,
     product_route_metrics,
     route_metrics,
+    threshold_sensitivity,
 )
 
 
@@ -36,27 +37,68 @@ st.set_page_config(
 inject_css()
 df = load_data()
 
+# -----------------------------------------------------------------------------
+# Shared analytical framework
+# -----------------------------------------------------------------------------
+SERVICE_THRESHOLD = 0.80
+SERVICE_THRESHOLD_PCT = SERVICE_THRESHOLD * 100.0
+
 portfolio = portfolio_metrics(df)
 held = held_metrics(df)
 conc = concentration_metrics(df)
 loss = loss_concentration(df)
-_, cf_route = counterfactual_metrics(df)
+cf_shipments, cf_route = counterfactual_metrics(
+    df,
+    service_threshold=SERVICE_THRESHOLD,
+)
 route = route_metrics(df)
 customers = customer_metrics(df)
-product_route = product_route_metrics(df)
+product_route = product_route_metrics(
+    df,
+    service_threshold=SERVICE_THRESHOLD,
+)
+
+# Counterfactual portfolio view.  These values come from the same
+# disruption-era actionable benchmark used by the decision engine and
+# scenario engine: non-Direct / non-Held, >=80% DIFOT, minimum 5 observations.
+actionable_avoidable = float(
+    cf_shipments["Avoidable_Exposure_USD"].sum(skipna=True)
+)
+actionable_residual = float(
+    cf_shipments["Residual_Exposure_USD"].sum(skipna=True)
+)
+
+actionable_benchmarkable_shipments = int(
+    cf_shipments["Actionable_Benchmark_Available"].sum()
+)
+
+actionable_revenue_coverage = float(
+    cf_shipments.loc[
+        cf_shipments["Actionable_Benchmark_Available"],
+        "Contracted_Freight_Revenue_USD",
+    ].sum()
+    / max(float(portfolio["contracted_revenue"]), 1.0)
+)
 
 # -----------------------------------------------------------------------------
 # PAGE HEADER
 # -----------------------------------------------------------------------------
 page_header(
-    "STRAIT OUTTA HORMUZ",
-    "WAR ROOM CONTROL · What is happening to the business right now?",
+    "MINIMISE THE LOSS, NOT THE DISRUPTION",
+    "EXECUTIVE WAR ROOM · Isolate addressable loss, protect service, and stop paying to move uneconomic cargo.",
+)
+
+st.markdown(
+    "<div class='info-card'><strong>Management objective:</strong> minimise residual economic loss while maintaining an "
+    f"<strong>{SERVICE_THRESHOLD_PCT:.0f}% DIFOT</strong> service constraint. "
+    "The actionable benchmark excludes Direct (pre-blockade reference only) and Held cargo, and requires at least five observed shipments.</div>",
+    unsafe_allow_html=True,
 )
 
 # -----------------------------------------------------------------------------
 # EXECUTIVE KPI ROW
 # -----------------------------------------------------------------------------
-kpi_cols = st.columns(4)
+kpi_cols = st.columns(6)
 
 with kpi_cols[0]:
     metric_card(
@@ -67,34 +109,99 @@ with kpi_cols[0]:
 
 with kpi_cols[1]:
     metric_card(
-        "Revenue Recognised",
-        fmt_money(portfolio["recognized_revenue"]),
-        f'{fmt_money(portfolio["unrecognized_revenue"])} remains unrecognised',
+        "Current Gross Margin",
+        fmt_money(portfolio["gross_margin"]),
+        f'{fmt_pct(portfolio["gross_margin_pct_of_contracted"])} of contracted revenue',
     )
 
 with kpi_cols[2]:
     metric_card(
-        "Gross Margin",
-        fmt_money(portfolio["gross_margin"]),
-        fmt_pct(portfolio["gross_margin_pct_of_contracted"])
-        + " of contracted revenue",
+        "Modeled Avoidable Loss",
+        fmt_money(actionable_avoidable),
+        "disruption-era actionable benchmark",
     )
 
 with kpi_cols[3]:
     metric_card(
-        "Immobilised Cargo",
-        fmt_money(held["immobilised_cargo_value"]),
-        f'{portfolio["held_shipments"]:,} held shipments · {fmt_money(held["trapped_contracted_revenue"])} trapped revenue',
+        "Modeled Residual Loss",
+        fmt_money(actionable_residual),
+        "after applying actionable benchmark",
     )
 
-st.write("")
+with kpi_cols[4]:
+    metric_card(
+        "Immobilised Cargo",
+        fmt_money(held["immobilised_cargo_value"]),
+        f'{portfolio["held_shipments"]:,} held · {fmt_money(held["trapped_contracted_revenue"])} trapped revenue',
+    )
+
+with kpi_cols[5]:
+    metric_card(
+        "Portfolio DIFOT",
+        f'{portfolio["difot_pct"]:.1f}%',
+        f'{SERVICE_THRESHOLD_PCT:.0f}% management service constraint',
+    )
+
+st.caption(
+    f"Actionable benchmark coverage: {actionable_benchmarkable_shipments:,} of {len(df):,} shipments "
+    f"({actionable_benchmarkable_shipments / max(len(df), 1):.1%}) and "
+    f"{actionable_revenue_coverage:.1%} of contracted revenue. Avoidable and residual exposure are benchmarked only where an observed actionable route exists."
+)
 
 # -----------------------------------------------------------------------------
-# 1. REVENUE -> COST -> MARGIN BRIDGE
+# 1. LOSS POSITION
+# -----------------------------------------------------------------------------
+section_header(
+    "THE LOSS HAS TWO PARTS: ADDRESSABLE AND RESIDUAL",
+    "The current portfolio loss is not assumed to be fully recoverable. The benchmark framework isolates the portion that can be addressed by observed disruption-era route economics, while the remainder stays as residual modeled loss.",
+)
+
+loss_fig = go.Figure()
+loss_fig.add_trace(
+    go.Bar(
+        x=["Current portfolio loss", "Modeled avoidable loss", "Modeled residual loss"],
+        y=[
+            abs(float(portfolio["gross_margin"])) / 1e6,
+            actionable_avoidable / 1e6,
+            actionable_residual / 1e6,
+        ],
+        text=[
+            fmt_money(abs(float(portfolio["gross_margin"]))),
+            fmt_money(actionable_avoidable),
+            fmt_money(actionable_residual),
+        ],
+        textposition="outside",
+        marker_color=["#E63946", "#F59E0B", "#64748B"],
+        hovertemplate="<b>%{x}</b><br>$%{y:.1f}M<extra></extra>",
+    )
+)
+loss_fig.update_layout(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    height=350,
+    margin=dict(l=10, r=20, t=15, b=40),
+    showlegend=False,
+    yaxis_title="USD millions",
+    xaxis_title="",
+)
+loss_fig.update_yaxes(gridcolor="#1E293B", zeroline=False)
+st.plotly_chart(
+    loss_fig,
+    use_container_width=True,
+    config={"displayModeBar": False},
+)
+
+st.caption(
+    "The historical/pre-blockade benchmark may use Direct as a reference. The actionable view is deliberately stricter because Direct is not treated as guaranteed future capacity."
+)
+
+# -----------------------------------------------------------------------------
+# 2. REVENUE -> COST -> MARGIN BRIDGE
 # -----------------------------------------------------------------------------
 section_header(
     "HOW DID THE PORTFOLIO GET HERE?",
-    "The business starts with contracted revenue, loses recognition on held cargo, then absorbs a cost-to-serve base larger than recognised revenue.",
+    "Contracted revenue is reduced by unrecognised revenue, while total cost-to-serve materially exceeds recognised revenue.",
 )
 
 waterfall = go.Figure(
@@ -135,7 +242,7 @@ waterfall.update_layout(
     template="plotly_dark",
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
-    height=360,
+    height=350,
     showlegend=False,
     margin=dict(l=10, r=30, t=15, b=10),
     yaxis_title="USD millions",
@@ -149,105 +256,118 @@ st.plotly_chart(
 )
 
 # -----------------------------------------------------------------------------
-# 2. ROUTE ECONOMICS × SERVICE MATRIX
+# 3. ACTIONABLE ROUTE LANDSCAPE
 # -----------------------------------------------------------------------------
 section_header(
-    "WHERE IS THE ROUTE DAMAGE — AND DOES SERVICE JUSTIFY IT?",
-    "Each bubble is a current route. X = modeled avoidable exposure, Y = observed DIFOT, size = shipment count. The 80% line is the service-compliance benchmark.",
+    "WHERE CAN WE ACTUALLY REDUCE THE LOSS?",
+    "Only disruption-era transport options are plotted here. X = modeled avoidable exposure, Y = observed DIFOT, size = shipments. The 80% line is the shared service constraint.",
 )
 
-route_view = cf_route.merge(
-    route[["Route_Canonical", "DIFOT_Pct", "Cargo_Value_USD", "Contracted_Revenue_USD"]],
+actionable_route_view = cf_route.merge(
+    route[
+        [
+            "Route_Canonical",
+            "DIFOT_Pct",
+            "Cargo_Value_USD",
+            "Contracted_Revenue_USD",
+        ]
+    ],
     on="Route_Canonical",
     how="left",
     suffixes=("", "_route"),
 )
-route_view = route_view[route_view["Route_Canonical"].notna()].copy()
-route_view["Exposure_M"] = route_view["Avoidable_Exposure_USD"] / 1e6
-route_view["Bubble_Size"] = route_view["Shipments"].clip(lower=1)
+actionable_route_view = actionable_route_view[
+    ~actionable_route_view["Route_Canonical"].isin(["Direct", "Held"])
+].copy()
+actionable_route_view = actionable_route_view[
+    actionable_route_view["Avoidable_Exposure_USD"].notna()
+].copy()
+actionable_route_view["Exposure_M"] = (
+    actionable_route_view["Avoidable_Exposure_USD"] / 1e6
+)
 
-fig_route = go.Figure()
-
-fig_route.add_trace(
-    go.Scatter(
-        x=route_view["Exposure_M"],
-        y=route_view["DIFOT_Pct"],
-        mode="markers+text",
-        text=route_view["Route_Canonical"],
-        textposition="top center",
-        marker=dict(
-            size=route_view["Bubble_Size"] * 2.3 + 10,
-            color=route_view["DIFOT_Pct"],
-            colorscale=[
-                [0.0, "#E63946"],
-                [0.8, "#F59E0B"],
-                [1.0, "#22C55E"],
-            ],
-            cmin=0,
-            cmax=100,
-            line=dict(color="#0F172A", width=1.5),
-            colorbar=dict(title="DIFOT", ticksuffix="%"),
-            opacity=0.92,
-        ),
-        customdata=np.stack(
-            [
-                route_view["Shipments"],
-                route_view["Contracted_Revenue_USD"],
-                route_view["Residual_Exposure_USD"],
-            ],
-            axis=-1,
-        ),
-        hovertemplate=(
-            "<b>%{text}</b><br>"
-            "Avoidable exposure: $%{x:.1f}M<br>"
-            "DIFOT: %{y:.1f}%<br>"
-            "Shipments: %{customdata[0]:.0f}<br>"
-            "Contracted revenue: $%{customdata[1]:,.0f}<br>"
-            "Residual exposure: $%{customdata[2]:,.0f}<extra></extra>"
-        ),
+if actionable_route_view.empty:
+    st.info("No actionable route-level counterfactual is available in the observed dataset.")
+else:
+    fig_route = go.Figure()
+    fig_route.add_trace(
+        go.Scatter(
+            x=actionable_route_view["Exposure_M"],
+            y=actionable_route_view["DIFOT_Pct"],
+            mode="markers+text",
+            text=actionable_route_view["Route_Canonical"],
+            textposition="top center",
+            marker=dict(
+                size=actionable_route_view["Shipments"].clip(lower=1) * 2.1 + 10,
+                color=actionable_route_view["DIFOT_Pct"],
+                colorscale=[
+                    [0.0, "#E63946"],
+                    [0.8, "#F59E0B"],
+                    [1.0, "#22C55E"],
+                ],
+                cmin=0,
+                cmax=100,
+                line=dict(color="#0F172A", width=1.5),
+                colorbar=dict(title="DIFOT", ticksuffix="%"),
+                opacity=0.92,
+            ),
+            customdata=np.stack(
+                [
+                    actionable_route_view["Shipments"],
+                    actionable_route_view["Contracted_Revenue_USD"],
+                    actionable_route_view["Residual_Exposure_USD"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Modeled avoidable exposure: $%{x:.1f}M<br>"
+                "Observed DIFOT: %{y:.1f}%<br>"
+                "Shipments: %{customdata[0]:.0f}<br>"
+                "Contracted revenue: $%{customdata[1]:,.0f}<br>"
+                "Residual exposure: $%{customdata[2]:,.0f}<extra></extra>"
+            ),
+        )
     )
-)
 
-fig_route.add_hline(
-    y=80,
-    line_dash="dash",
-    line_color="#F59E0B",
-    annotation_text="80% service threshold",
-    annotation_position="top left",
-)
+    fig_route.add_hline(
+        y=SERVICE_THRESHOLD_PCT,
+        line_dash="dash",
+        line_color="#F59E0B",
+        annotation_text=f"{SERVICE_THRESHOLD_PCT:.0f}% service constraint",
+        annotation_position="top left",
+    )
+    fig_route.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=410,
+        showlegend=False,
+        margin=dict(l=10, r=10, t=25, b=10),
+        xaxis_title="Modeled avoidable exposure (USD millions)",
+        yaxis_title="Observed DIFOT",
+    )
+    fig_route.update_xaxes(gridcolor="#1E293B", zeroline=False)
+    fig_route.update_yaxes(gridcolor="#1E293B", ticksuffix="%", range=[-5, 108])
+    st.plotly_chart(
+        fig_route,
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
 
-fig_route.update_layout(
-    template="plotly_dark",
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    height=410,
-    showlegend=False,
-    margin=dict(l=10, r=10, t=25, b=10),
-    xaxis_title="Modeled avoidable exposure (USD millions)",
-    yaxis_title="Observed DIFOT",
-)
-fig_route.update_xaxes(gridcolor="#1E293B", zeroline=False)
-fig_route.update_yaxes(
-    gridcolor="#1E293B",
-    ticksuffix="%",
-    range=[-5, 108],
-)
-
-st.plotly_chart(
-    fig_route,
-    use_container_width=True,
-    config={"displayModeBar": False},
+st.caption(
+    "Direct is intentionally absent from this action map: it is a pre-blockade historical reference, not a guaranteed disruption-era route. Held cargo is handled separately as a release priority."
 )
 
 # -----------------------------------------------------------------------------
-# 3. CUSTOMER REVENUE SHARE × LOSS SHARE MATRIX
+# 4. CUSTOMER REVENUE SHARE × LOSS SHARE MATRIX
 # -----------------------------------------------------------------------------
 left, right = st.columns([1.2, 1])
 
 with left:
     section_header(
         "WHO CARRIES THE COMMERCIAL EXPOSURE?",
-        "Points above the diagonal are carrying a larger share of margin loss than their share of contracted revenue.",
+        "Points above the diagonal carry a larger share of portfolio margin loss than their share of contracted revenue.",
     )
 
     cust_view = customers.copy()
@@ -271,13 +391,18 @@ with left:
     cust_view["Bubble_Size"] = np.sqrt(cust_view["Cargo_Value_M"].clip(lower=0)) * 4 + 8
 
     fig_customer = go.Figure()
+    max_axis = max(
+        float(cust_view["Revenue_Share"].max()),
+        float(cust_view["Margin_Loss_Share"].max()),
+        0.1,
+    ) * 1.12
 
     fig_customer.add_shape(
         type="line",
         x0=0,
         y0=0,
-        x1=max(cust_view["Revenue_Share"].max(), cust_view["Margin_Loss_Share"].max()) * 1.08,
-        y1=max(cust_view["Revenue_Share"].max(), cust_view["Margin_Loss_Share"].max()) * 1.08,
+        x1=max_axis,
+        y1=max_axis,
         line=dict(color="#64748B", dash="dash", width=1),
     )
 
@@ -286,7 +411,14 @@ with left:
             x=cust_view["Revenue_Share"],
             y=cust_view["Margin_Loss_Share"],
             mode="markers+text",
-            text=cust_view["Customer_Name"].str.replace(" Energy Partners", "", regex=False).str.replace(" Crude Traders", "", regex=False).str.replace(" Petrochem", "", regex=False).str.replace(" Fuel Alliance", "", regex=False).str.replace(" Refining Group", "", regex=False),
+            text=(
+                cust_view["Customer_Name"]
+                .str.replace(" Energy Partners", "", regex=False)
+                .str.replace(" Crude Traders", "", regex=False)
+                .str.replace(" Petrochem", "", regex=False)
+                .str.replace(" Fuel Alliance", "", regex=False)
+                .str.replace(" Refining Group", "", regex=False)
+            ),
             textposition="top center",
             marker=dict(
                 size=cust_view["Bubble_Size"],
@@ -331,9 +463,8 @@ with left:
         xaxis_title="Contracted revenue share",
         yaxis_title="Portfolio margin-loss share",
     )
-    fig_customer.update_xaxes(gridcolor="#1E293B", tickformat=".0%", range=[0, max(cust_view["Revenue_Share"].max(), 0.1) * 1.12])
-    fig_customer.update_yaxes(gridcolor="#1E293B", tickformat=".0%", range=[0, max(cust_view["Margin_Loss_Share"].max(), 0.1) * 1.12])
-
+    fig_customer.update_xaxes(gridcolor="#1E293B", tickformat=".0%", range=[0, max_axis])
+    fig_customer.update_yaxes(gridcolor="#1E293B", tickformat=".0%", range=[0, max_axis])
     st.plotly_chart(
         fig_customer,
         use_container_width=True,
@@ -372,8 +503,8 @@ with right:
         annotation_text="80% of loss",
         annotation_position="top left",
     )
-    threshold_rank = loss["shipments_to_threshold"]
-    threshold_share = loss["threshold_share"]
+    threshold_rank = int(loss["shipments_to_threshold"])
+    threshold_share = float(loss["threshold_share"])
     fig_pareto.add_trace(
         go.Scatter(
             x=[threshold_rank],
@@ -382,7 +513,11 @@ with right:
             text=[f"{threshold_rank} shipments\n{threshold_rank / len(df):.1%} of book"],
             textposition="bottom right",
             marker=dict(size=11, color="#F59E0B", line=dict(color="#0F172A", width=1.5)),
-            hovertemplate=f"<b>{threshold_rank} shipments</b><br>Book share: {threshold_rank / len(df):.1%}<br>Loss share: {threshold_share:.1%}<extra></extra>",
+            hovertemplate=(
+                f"<b>{threshold_rank} shipments</b><br>"
+                f"Book share: {threshold_rank / len(df):.1%}<br>"
+                f"Loss share: {threshold_share:.1%}<extra></extra>"
+            ),
         )
     )
 
@@ -398,7 +533,6 @@ with right:
     )
     fig_pareto.update_xaxes(gridcolor="#1E293B", rangemode="tozero")
     fig_pareto.update_yaxes(gridcolor="#1E293B", tickformat=".0%", range=[0, 1.05])
-
     st.plotly_chart(
         fig_pareto,
         use_container_width=True,
@@ -406,11 +540,116 @@ with right:
     )
 
 # -----------------------------------------------------------------------------
-# 4. PRODUCT × ROUTE ECONOMICS HEATMAP
+# 5. WHY 80%? THRESHOLD SENSITIVITY
 # -----------------------------------------------------------------------------
 section_header(
-    "WHICH ROUTE / PRODUCT COMBINATIONS BREAK THE ECONOMICS?",
-    "Observed median cost per ton by product and route. The annotations pair cost with observed DIFOT so expensive service does not get confused with service value.",
+    "WHY KEEP 80% AS THE SERVICE CONSTRAINT?",
+    "Threshold sensitivity shows where observed disruption-era alternatives disappear. 80% is retained as the management constraint: 70% admits the 70%-DIFOT Refined→Cape option, 75% removes it while retaining Crude→Cape, and 81% removes the 80%-DIFOT Crude→Cape alternative.",
+)
+
+thresholds_to_show = [0.70, 0.75, 0.80, 0.81, 0.85, 0.90]
+sensitivity = threshold_sensitivity(df, thresholds=thresholds_to_show)
+
+left, right = st.columns([1.25, 0.9])
+with left:
+    fig_threshold = go.Figure()
+    fig_threshold.add_trace(
+        go.Scatter(
+            x=sensitivity["Threshold"] * 100,
+            y=sensitivity["Revenue_Coverage_Pct"],
+            mode="lines+markers",
+            name="Revenue coverage",
+            line=dict(color="#60A5FA", width=3),
+            marker=dict(size=8),
+            hovertemplate="Threshold: %{x:.0f}%<br>Revenue coverage: %{y:.1f}%<extra></extra>",
+        )
+    )
+    fig_threshold.add_trace(
+        go.Scatter(
+            x=sensitivity["Threshold"] * 100,
+            y=sensitivity["Addressable_Loss_M"],
+            mode="lines+markers",
+            name="Addressable loss ($M)",
+            yaxis="y2",
+            line=dict(color="#F59E0B", width=3),
+            marker=dict(size=8),
+            hovertemplate="Threshold: %{x:.0f}%<br>Addressable loss: $%{y:.1f}M<extra></extra>",
+        )
+    )
+    fig_threshold.add_vline(
+        x=SERVICE_THRESHOLD_PCT,
+        line_dash="dash",
+        line_color="#FDE68A",
+        annotation_text="80%",
+        annotation_position="top left",
+    )
+    fig_threshold.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=330,
+        margin=dict(l=10, r=10, t=15, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis_title="Observed DIFOT threshold",
+        yaxis=dict(title="Revenue coverage (%)", ticksuffix="%", gridcolor="#1E293B"),
+        yaxis2=dict(
+            title="Addressable loss (USD M)",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+    )
+    st.plotly_chart(
+        fig_threshold,
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+
+with right:
+    display = sensitivity.copy()
+    display["Threshold"] = display["Threshold"] * 100
+    display = display[
+        [
+            "Threshold",
+            "Products_Covered",
+            "Shipment_Coverage_Pct",
+            "Revenue_Coverage_Pct",
+            "Addressable_Loss_USD",
+            "Residual_Loss_USD",
+        ]
+    ]
+    display.columns = [
+        "Threshold",
+        "Products",
+        "Shipments Covered",
+        "Revenue Covered",
+        "Addressable Loss",
+        "Residual Loss",
+    ]
+    st.dataframe(
+        display.style.format(
+            {
+                "Threshold": "{:.0f}%",
+                "Shipments Covered": "{:.1f}%",
+                "Revenue Covered": "{:.1f}%",
+                "Addressable Loss": "${:,.0f}",
+                "Residual Loss": "${:,.0f}",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "This is sensitivity analysis, not a claim that 80% is a universal industry standard. "
+        "The management constraint is retained because it preserves the key Crude→Cape alternative while excluding the 70%-DIFOT Refined→Cape option."
+    )
+
+# -----------------------------------------------------------------------------
+# 6. PRODUCT × ROUTE ECONOMICS HEATMAP
+# -----------------------------------------------------------------------------
+section_header(
+    "WHICH PRODUCT × ROUTE COMBINATIONS BREAK THE ECONOMICS?",
+    "Observed median cost per ton by product and route. Cell labels pair cost with observed DIFOT; route-role notes prevent historical Direct and Held from being misread as interchangeable options.",
 )
 
 heat = product_route.copy()
@@ -418,8 +657,16 @@ heat["Cost_Label"] = heat["Median_Cost_per_Ton_USD"].map(lambda x: f"${x:,.0f}")
 heat["DIFOT_Label"] = heat["DIFOT_Pct"].map(lambda x: f"{x:.0f}%")
 heat["Cell_Label"] = heat["Cost_Label"] + " / " + heat["DIFOT_Label"]
 
-pivot = heat.pivot(index="Product_Category", columns="Route_Canonical", values="Median_Cost_per_Ton_USD")
-labels = heat.pivot(index="Product_Category", columns="Route_Canonical", values="Cell_Label")
+pivot = heat.pivot(
+    index="Product_Category",
+    columns="Route_Canonical",
+    values="Median_Cost_per_Ton_USD",
+)
+labels = heat.pivot(
+    index="Product_Category",
+    columns="Route_Canonical",
+    values="Cell_Label",
+)
 
 route_order = ["Direct", "Overland", "Cape", "Pipeline", "Air", "Held"]
 route_order = [r for r in route_order if r in pivot.columns]
@@ -470,8 +717,9 @@ st.plotly_chart(
 # -----------------------------------------------------------------------------
 st.write("")
 action_chips(["RELEASE", "REROUTE", "REPRICE", "SELECTIVE PROTECT"])
-st.markdown("### Protect the customer, not the uneconomic route.")
+st.markdown("### Protect the economics, then protect the service.")
 st.caption(
-    "Benchmark terminology: observed · modeled · service-compliant · not a causal forecast. "
-    "Direct remains a pre-blockade benchmark, not a guaranteed post-blockade option."
+    "Shared framework: 80% DIFOT management constraint · Direct = historical reference · Held = release priority · "
+    "actionable benchmark = cheapest observed non-Direct/non-Held route meeting the constraint with at least five observations · "
+    "no compliant observed alternative = reprice / negotiate rather than force an uneconomic reroute."
 )

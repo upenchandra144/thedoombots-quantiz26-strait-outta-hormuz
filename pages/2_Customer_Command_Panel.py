@@ -15,8 +15,13 @@ from src.components import (
     warning_card,
 )
 from src.data_loader import load_data
-from src.decision_rules import decision_for_row
-from src.metrics import customer_metrics, customer_product_metrics, customer_route_metrics
+from src.decision_rules import DecisionThresholds, decision_for_row
+from src.metrics import (
+    counterfactual_metrics,
+    customer_metrics,
+    customer_product_metrics,
+    customer_route_metrics,
+)
 
 
 st.set_page_config(
@@ -26,6 +31,12 @@ st.set_page_config(
 )
 inject_css()
 df = load_data()
+
+# The 80% DIFOT requirement is the management service constraint used
+# consistently across the metrics, decision engine and scenario engine.
+SERVICE_THRESHOLD = 0.80
+THRESHOLDS = DecisionThresholds(service_threshold=SERVICE_THRESHOLD)
+SERVICE_THRESHOLD_PCT = SERVICE_THRESHOLD * 100.0
 
 
 # -----------------------------------------------------------------------------
@@ -46,6 +57,21 @@ def add_plotly_base_layout(fig: go.Figure, height: int = 360) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig
+
+
+def route_role(route_name: str) -> str:
+    """Explain route status without treating Direct as future guaranteed capacity."""
+    if route_name == "Held":
+        return "RELEASE PRIORITY"
+    if route_name == "Direct":
+        return "HISTORICAL REFERENCE"
+    return "DISRUPTION-ERA ROUTE"
+
+
+def service_status(difot_pct: float) -> str:
+    if difot_pct >= SERVICE_THRESHOLD_PCT:
+        return "MEETS 80%"
+    return "BELOW 80%"
 
 
 # -----------------------------------------------------------------------------
@@ -76,7 +102,8 @@ with status_col:
     st.markdown(
         f"<div class='info-card'><strong>{exposure_label}</strong><br>"
         f"{summary['shipments']} shipments · {summary['revenue_share']:.1%} of portfolio revenue · "
-        f"{summary['margin_loss_share']:.1%} of portfolio margin loss</div>",
+        f"{summary['margin_loss_share']:.1%} of portfolio margin loss<br>"
+        f"<span style='color:#FDE68A'>Management service constraint: {SERVICE_THRESHOLD_PCT:.0f}% DIFOT</span></div>",
         unsafe_allow_html=True,
     )
 
@@ -108,6 +135,15 @@ kpis = [
 for col, (label, value, sub) in zip(cols, kpis):
     with col:
         metric_card(label, value, sub)
+
+
+# -----------------------------------------------------------------------------
+# Shared counterfactual view for this customer's products
+# -----------------------------------------------------------------------------
+# This is calculated once per page render and gives the command panel the same
+# actionable-vs-historical benchmark language used by Pages 3 and 4.
+cf_df, _ = counterfactual_metrics(df, SERVICE_THRESHOLD)
+customer_cf = cf_df[cf_df["Customer_Name"].eq(customer)].copy()
 
 
 # -----------------------------------------------------------------------------
@@ -170,7 +206,7 @@ with right:
 
     action_records: list[dict[str, object]] = []
     for _, shipment_row in top_loss.iterrows():
-        decision = decision_for_row(df, shipment_row)
+        decision = decision_for_row(df, shipment_row, thresholds=THRESHOLDS)
         action_records.append(
             {
                 "Shipment_ID": str(shipment_row["Shipment_ID"]),
@@ -207,7 +243,10 @@ with right:
         fig_actions.update_yaxes(title="")
         add_plotly_base_layout(fig_actions, 250)
         st.plotly_chart(fig_actions, use_container_width=True, config={"displayModeBar": False})
-        st.caption("Decision actions are rule-based; they are not ML predictions.")
+        st.caption(
+            f"Decision actions are rule-based; they are not ML predictions. "
+            f"The shared management service constraint is {SERVICE_THRESHOLD_PCT:.0f}% DIFOT."
+        )
     else:
         st.info("No loss-exposed shipments are available for this customer.")
 
@@ -218,7 +257,7 @@ with right:
 st.write("")
 section_header(
     "WHERE IS THE CUSTOMER EXPOSURE?",
-    "Route points combine financial damage and service performance. Larger bubbles represent contracted revenue.",
+    "Route points combine financial damage and service performance. Larger bubbles represent contracted revenue. Direct is historical reference; Held is a release queue.",
 )
 
 route = customer_route_metrics(df, customer).copy()
@@ -233,6 +272,8 @@ route_extra = (
     .reset_index()
 )
 route = route.merge(route_extra, on="Route_Canonical", how="left")
+route["Route_Role"] = route["Route_Canonical"].map(route_role)
+route["Service_Status"] = route["DIFOT_Pct"].map(service_status)
 
 route_fig = px.scatter(
     route,
@@ -240,6 +281,7 @@ route_fig = px.scatter(
     y="Margin_Loss_USD",
     size="Contracted_Revenue_USD",
     color="Route_Canonical",
+    symbol="Route_Role",
     hover_name="Route_Canonical",
     custom_data=[
         "Shipments",
@@ -247,6 +289,8 @@ route_fig = px.scatter(
         "DIFOT_Pct",
         "Held_Shipments",
         "Median_Cost_per_Ton_USD",
+        "Route_Role",
+        "Service_Status",
     ],
     size_max=42,
 )
@@ -258,7 +302,9 @@ route_fig.update_traces(
         "Revenue: $%{customdata[1]:,.0f}<br>"
         "Shipments: %{customdata[0]}<br>"
         "Held: %{customdata[3]}<br>"
-        "Median cost/ton: $%{customdata[4]:,.2f}<extra></extra>"
+        "Median cost/ton: $%{customdata[4]:,.2f}<br>"
+        "Role: %{customdata[5]}<br>"
+        "Service: %{customdata[6]}<extra></extra>"
     )
 )
 route_fig.add_hline(
@@ -268,21 +314,21 @@ route_fig.add_hline(
     line_color="#64748B",
 )
 route_fig.add_vline(
-    x=80,
+    x=SERVICE_THRESHOLD_PCT,
     line_width=1.5,
     line_dash="dash",
     line_color="#FDE68A",
-    annotation_text="80% DIFOT",
+    annotation_text=f"{SERVICE_THRESHOLD_PCT:.0f}% DIFOT constraint",
     annotation_position="top right",
 )
 route_fig.update_xaxes(title="Observed DIFOT (%)", range=[0, 105], showgrid=False)
 route_fig.update_yaxes(title="Margin loss (USD)", tickprefix="$", separatethousands=True)
-add_plotly_base_layout(route_fig, 390)
+add_plotly_base_layout(route_fig, 410)
 st.plotly_chart(route_fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # -----------------------------------------------------------------------------
-# 3. Product × route concentration heatmap
+# 3. Product × route concentration heatmap + actionable product benchmark
 # -----------------------------------------------------------------------------
 st.write("")
 left, right = st.columns([1.15, 0.85])
@@ -291,13 +337,6 @@ with left:
     section_header(
         "PRODUCT × ROUTE LOSS CONCENTRATION",
         "Cells show modeled margin loss for this customer. This exposes whether the problem is product-specific, route-specific, or both.",
-    )
-    heat = route.merge(
-        customer_work.groupby("Route_Canonical")
-        .agg(Revenue_USD=("Contracted_Freight_Revenue_USD", "sum"))
-        .reset_index(),
-        on="Route_Canonical",
-        how="left",
     )
 
     customer_product_route = (
@@ -339,9 +378,26 @@ with left:
 with right:
     section_header(
         "CUSTOMER × PRODUCT EXPOSURE",
-        "Financial exposure and service performance by product category.",
+        "Financial exposure and service performance by product category, paired with the disruption-era benchmark used by the decision engine.",
     )
     prod = customer_product_metrics(df, customer).copy()
+
+    benchmark_by_product = (
+        customer_cf.groupby("Product_Category", as_index=False)
+        .agg(
+            Actionable_Benchmark_Route=("Actionable_Benchmark_Route", "first"),
+            Actionable_Benchmark_DIFOT=("Actionable_Benchmark_DIFOT", "first"),
+            Actionable_Benchmark_Cost_per_Ton_USD=("Actionable_Benchmark_Cost_per_Ton_USD", "first"),
+            Actionable_Benchmark_N=("Actionable_Benchmark_N", "first"),
+            Actionable_Benchmark_Evidence_Level=("Actionable_Benchmark_Evidence_Level", "first"),
+            Actionable_Benchmark_Wilson_Lower=("Actionable_Benchmark_Wilson_Lower", "first"),
+            Actionable_Benchmark_Wilson_Upper=("Actionable_Benchmark_Wilson_Upper", "first"),
+            Actionable_Benchmark_Borderline_Evidence=("Actionable_Benchmark_Borderline_Evidence", "first"),
+            Conditional_Fallback_Route=("Conditional_Fallback_Route", "first"),
+            Conditional_Fallback_DIFOT=("Conditional_Fallback_DIFOT", "first"),
+        )
+    )
+
     prod_display = prod[
         [
             "Product_Category",
@@ -353,6 +409,42 @@ with right:
             "Route_Concentration",
         ]
     ].copy()
+    prod_display = prod_display.merge(
+        benchmark_by_product,
+        on="Product_Category",
+        how="left",
+    )
+    prod_display["Benchmark DIFOT"] = prod_display["Actionable_Benchmark_DIFOT"].mul(100.0)
+    prod_display["Benchmark"] = prod_display["Actionable_Benchmark_Route"].fillna("None observed")
+    prod_display["Fallback"] = prod_display["Conditional_Fallback_Route"].fillna("None observed")
+
+    def evidence_label(row: pd.Series) -> str:
+        evidence = row.get("Actionable_Benchmark_Evidence_Level")
+        borderline = bool(row.get("Actionable_Benchmark_Borderline_Evidence", False))
+        if pd.isna(evidence):
+            return "NONE"
+        label = str(evidence)
+        if borderline:
+            label += " · BORDERLINE"
+        return label
+
+    prod_display["Evidence"] = prod_display.apply(evidence_label, axis=1)
+
+    prod_display = prod_display[
+        [
+            "Product_Category",
+            "Shipments",
+            "Contracted_Revenue_USD",
+            "Gross_Margin_USD",
+            "DIFOT_Pct",
+            "Held_Shipments",
+            "Route_Concentration",
+            "Benchmark",
+            "Benchmark DIFOT",
+            "Evidence",
+            "Fallback",
+        ]
+    ]
     prod_display.columns = [
         "Product",
         "Shipments",
@@ -361,6 +453,10 @@ with right:
         "DIFOT",
         "Held",
         "Route Concentration",
+        "Actionable Benchmark",
+        "Benchmark DIFOT",
+        "Evidence",
+        "Conditional Fallback",
     ]
     st.dataframe(
         prod_display.style.format(
@@ -369,10 +465,15 @@ with right:
                 "Gross Margin": "${:,.0f}",
                 "DIFOT": "{:.1f}%",
                 "Route Concentration": "{:.1%}",
+                "Benchmark DIFOT": "{:.1f}%",
             }
         ),
         use_container_width=True,
         hide_index=True,
+    )
+    st.caption(
+        f"Actionable benchmarks exclude Direct and Held, require observed DIFOT ≥ {SERVICE_THRESHOLD_PCT:.0f}% and at least five observed shipments. "
+        "A conditional fallback is shown only when no compliant disruption-era route is observed."
     )
 
 
@@ -388,22 +489,26 @@ section_header(
 route_display = route[
     [
         "Route_Canonical",
+        "Route_Role",
         "Shipments",
         "Contracted_Revenue_USD",
         "Gross_Margin_USD",
         "Margin_Loss_USD",
         "DIFOT_Pct",
+        "Service_Status",
         "Held_Shipments",
         "Median_Cost_per_Ton_USD",
     ]
 ].copy()
 route_display.columns = [
     "Route",
+    "Role",
     "Shipments",
     "Contracted Revenue",
     "Gross Margin",
     "Margin Loss",
     "DIFOT",
+    "Service Status",
     "Held",
     "Median Cost/Ton",
 ]
@@ -433,7 +538,11 @@ section_header(
 
 if not top_loss.empty:
     anchor = top_loss.iloc[0]
-    anchor_decision = decision_for_row(df, anchor)
+    anchor_decision = decision_for_row(
+        df,
+        anchor,
+        thresholds=THRESHOLDS,
+    )
 
     # Build customer-specific evidence statements.
     dominant_route = route.iloc[0] if not route.empty else None
@@ -483,24 +592,58 @@ if not top_loss.empty:
             )
             metric_card(
                 "Modeled Avoidable Exposure",
-                fmt_money(anchor_decision.avoidable_exposure),
-                "observed benchmark framework",
-            )
-        with evidence_cols[1]:
-            metric_card(
-                "Best Service-Compliant Benchmark",
-                anchor_decision.best_service_compliant_route or "None observed",
-                (
-                    f"{anchor_decision.best_service_compliant_difot_pct:.1f}% DIFOT · "
-                    f"${anchor_decision.best_service_compliant_cost_per_ton:,.2f}/ton"
-                    if anchor_decision.benchmark_available
-                    else "No observed route meets 80% DIFOT"
-                ),
+                fmt_money(anchor_decision.avoidable_exposure or 0.0),
+                "observed actionable benchmark framework",
             )
             metric_card(
                 "Residual Exposure",
-                fmt_money(anchor_decision.residual_exposure),
-                "after applying the observed benchmark",
+                fmt_money(anchor_decision.residual_exposure or 0.0),
+                "after applying the observed actionable benchmark",
+            )
+
+        with evidence_cols[1]:
+            if anchor_decision.benchmark_available:
+                benchmark_sub = (
+                    f"{anchor_decision.actionable_benchmark_difot_pct:.1f}% DIFOT · "
+                    f"${anchor_decision.actionable_benchmark_cost_per_ton:,.2f}/ton · "
+                    f"n={anchor_decision.actionable_benchmark_n} · "
+                    f"{anchor_decision.actionable_benchmark_evidence_level or '—'}"
+                )
+                if anchor_decision.actionable_benchmark_borderline:
+                    benchmark_sub += " · borderline"
+                metric_card(
+                    "Actionable Benchmark",
+                    anchor_decision.actionable_benchmark_route or "None observed",
+                    benchmark_sub,
+                )
+            else:
+                fallback = anchor_decision.conditional_fallback_route or "None observed"
+                fallback_difot = anchor_decision.conditional_fallback_difot_pct
+                metric_card(
+                    "Actionable Benchmark",
+                    "None observed",
+                    "No observed disruption-era route meets the 80% DIFOT constraint",
+                )
+                metric_card(
+                    "Conditional Fallback",
+                    fallback,
+                    (
+                        f"{fallback_difot:.1f}% DIFOT · service gap below threshold"
+                        if fallback_difot is not None
+                        else "No observed fallback route"
+                    ),
+                )
+
+            historical_label = anchor_decision.historical_benchmark_route or "None observed"
+            historical_difot = anchor_decision.historical_benchmark_difot_pct
+            metric_card(
+                "Historical Benchmark",
+                historical_label,
+                (
+                    f"{historical_difot:.1f}% DIFOT · pre-blockade reference only"
+                    if historical_difot is not None
+                    else "No historical reference observed"
+                ),
             )
 
     if anchor_decision.warnings:
@@ -522,6 +665,8 @@ if summary["held_shipments"] > 0:
     )
 
 st.caption(
-    "Benchmark terminology: observed · modeled · service-compliant · avoidable exposure · residual exposure. "
-    "Direct remains a pre-blockade benchmark and is not represented as guaranteed future capacity."
+    f"Management service constraint: {SERVICE_THRESHOLD_PCT:.0f}% DIFOT. "
+    "Actionable benchmark = cheapest observed non-Direct, non-Held Product × Route meeting the constraint with at least five observed shipments. "
+    "Direct remains a pre-blockade historical reference and is not represented as guaranteed future capacity. "
+    "Refined routes without an observed compliant disruption-era alternative are treated as reprice/renegotiate cases, with a conditional fallback shown separately."
 )
